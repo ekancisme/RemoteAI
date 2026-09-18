@@ -131,6 +131,9 @@ export function App() {
     const [owner, repo] = selectedRepo.full_name.split('/');
 
     try {
+      // 0. Ensure RemoteAI labels exist (GitHub rejects unknown labels with 422)
+      await githubService.ensureTaskLabels(token, owner, repo);
+
       // 1. Create tracking issue in the target repository
       const titleSummary = prompt.length > 50 ? prompt.slice(0, 47) + '...' : prompt;
       const issue = await githubService.createTaskIssue(
@@ -144,8 +147,11 @@ export function App() {
 
       showNotification(`Đã tạo Task #${issue.number}! Đang khởi động GitHub Actions Runner...`);
 
-      // 2. Dispatch GitHub Actions workflow
-      await githubService.dispatchWorkflow(token, runnerRepo, {
+      // 2. Dispatch GitHub Actions workflow on the runner repo's default branch
+      const [runnerOwner, runnerRepoName] = runnerRepo.split('/');
+      const runnerInfo = await githubService.getRepo(token, runnerOwner, runnerRepoName);
+
+      await githubService.dispatchWorkflow(token, runnerRepo, runnerInfo.default_branch, {
         target_repo: selectedRepo.full_name,
         prompt,
         issue_number: issue.number.toString(),

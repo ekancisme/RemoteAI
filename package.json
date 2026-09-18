@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview --port 4173",
+    "deploy": "npm run build && gh pages deploy dist"
   },
   "dependencies": {
     "lucide-react": "^1.47.0",

@@ -93,6 +93,31 @@ export const githubService = {
     return githubFetch<{ name: string }[]>(`/repos/${owner}/${repo}/branches?per_page=30`, token);
   },
 
+  // Fetch repo metadata (used to resolve the default branch of the runner repo)
+  async getRepo(token: string, owner: string, repo: string): Promise<{ default_branch: string }> {
+    return githubFetch<{ default_branch: string }>(`/repos/${owner}/${repo}`, token);
+  },
+
+  // Ensure RemoteAI labels exist on the target repo — GitHub rejects issue
+  // creation with unknown labels (422), so create them up-front. Idempotent.
+  async ensureTaskLabels(token: string, owner: string, repo: string): Promise<void> {
+    const required = [
+      { name: 'remote-agent', color: '10b981', description: 'Managed by RemoteAI agent runner' },
+      { name: 'engine:agy', color: '06b6d4', description: 'RemoteAI engine: AGY (Gemini)' },
+      { name: 'engine:claude', color: '6366f1', description: 'RemoteAI engine: Claude Code' },
+    ];
+    for (const label of required) {
+      try {
+        await githubFetch(`/repos/${owner}/${repo}/labels`, token, {
+          method: 'POST',
+          body: JSON.stringify(label),
+        });
+      } catch {
+        // 422 = label already exists; any other failure is non-fatal here
+      }
+    }
+  },
+
   // Create an Issue that represents a coding task
   async createTaskIssue(
     token: string,
@@ -134,6 +159,7 @@ export const githubService = {
   async dispatchWorkflow(
     token: string,
     runnerRepo: string, // e.g. "ekancisme/RemoteAI" or "ekancisme/cuongplaylist"
+    ref: string, // Branch containing agent-task.yml (runner repo default branch)
     inputs: {
       target_repo: string;
       prompt: string;
@@ -152,7 +178,7 @@ export const githubService = {
       {
         method: 'POST',
         body: JSON.stringify({
-          ref: 'main', // Default branch containing the workflow
+          ref,
           inputs,
         }),
       }

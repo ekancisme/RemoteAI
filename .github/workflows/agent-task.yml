@@ -31,9 +31,6 @@ on:
         required: false
         default: ''
 
-  issues:
-    types: [opened, labeled]
-
   issue_comment:
     types: [created]
 
@@ -43,41 +40,64 @@ permissions:
   pull-requests: write
   actions: read
 
+# Prevent duplicate concurrent runs for the same task/issue. Runs are queued,
+# never cancelled mid-flight, so a follow-up comment waits for the agent to
+# finish its current pass instead of killing it.
+concurrency:
+  group: remote-agent-${{ github.event.issue.number || inputs.issue_number || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   run-agent:
-    # Only run for workflow_dispatch or issues/comments labeled with 'remote-agent'
+    # workflow_dispatch (from the RemoteAI app) or follow-up comments on issues
+    # labeled 'remote-agent'. Comments are restricted to repo collaborators —
+    # on a public repo anyone can comment, and each comment spends API credits.
     if: |
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'remote-agent')) ||
-      (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'remote-agent') && github.event.comment.user.type != 'Bot')
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.issue.labels.*.name, 'remote-agent') &&
+       github.event.comment.user.type != 'Bot' &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
+      # SECURITY: All untrusted text (prompt, issue body, comment body) is passed
+      # via env: and read as $VARIABLES inside run: blocks — never interpolated
+      # with ${{ }} directly into shell, which would allow command injection.
       - name: Resolve Task Parameters
         id: context
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+          INPUT_PROMPT: ${{ inputs.prompt }}
+          INPUT_ISSUE_NUM: ${{ inputs.issue_number }}
+          INPUT_AGENT: ${{ inputs.agent_type }}
+          INPUT_BASE: ${{ inputs.base_branch }}
+          INPUT_BRANCH: ${{ inputs.branch_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_NUM_EVENT: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TARGET_REPO="${{ inputs.target_repo }}"
-            PROMPT="${{ inputs.prompt }}"
-            ISSUE_NUM="${{ inputs.issue_number }}"
-            AGENT="${{ inputs.agent_type }}"
-            BASE="${{ inputs.base_branch }}"
-            BRANCH="${{ inputs.branch_name }}"
-          elif [ "${{ github.event_name }}" = "issues" ]; then
-            TARGET_REPO="${{ github.repository }}"
-            PROMPT="${{ github.event.issue.body }}"
-            ISSUE_NUM="${{ github.event.issue.number }}"
-            AGENT="agy"
-            BASE="main"
-            BRANCH=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TARGET_REPO="$INPUT_TARGET_REPO"
+            PROMPT="$INPUT_PROMPT"
+            ISSUE_NUM="$INPUT_ISSUE_NUM"
+            AGENT="$INPUT_AGENT"
+            BASE="$INPUT_BASE"
+            BRANCH="$INPUT_BRANCH"
           else
-            TARGET_REPO="${{ github.repository }}"
-            PROMPT="${{ github.event.comment.body }}"
-            ISSUE_NUM="${{ github.event.issue.number }}"
-            AGENT="agy"
-            BASE="main"
+            # issue_comment follow-up: continue the existing task branch,
+            # inheriting engine + base branch from the original task issue
+            TARGET_REPO="$REPO"
+            PROMPT="$COMMENT_BODY"
+            ISSUE_NUM="$ISSUE_NUM_EVENT"
             BRANCH=""
+            AGENT=$(gh issue view "$ISSUE_NUM" --repo "$TARGET_REPO" --json labels \
+              --jq 'if ([.labels[].name] | index("engine:claude")) then "claude" else "agy" end' 2>/dev/null || echo "agy")
+            BASE=$(gh repo view "$TARGET_REPO" --json defaultBranchRef \
+              --jq '.defaultBranchRef.name' 2>/dev/null || echo "main")
           fi
 
           if [ -z "$BRANCH" ]; then
@@ -85,28 +105,33 @@ jobs:
             BRANCH="agent/task-${ISSUE_NUM:-$TIMESTAMP}"
           fi
 
-          echo "target_repo=$TARGET_REPO" >> "$GITHUB_OUTPUT"
-          echo "prompt=$PROMPT" >> "$GITHUB_OUTPUT"
-          echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
-          echo "agent_type=$AGENT" >> "$GITHUB_OUTPUT"
-          echo "base_branch=$BASE" >> "$GITHUB_OUTPUT"
-          echo "branch_name=$BRANCH" >> "$GITHUB_OUTPUT"
+          # Write outputs safely via files to survive multi-line prompts
+          {
+            echo "target_repo=$TARGET_REPO"
+            echo "agent_type=$AGENT"
+            echo "base_branch=$BASE"
+            echo "branch_name=$BRANCH"
+            echo "issue_number=$ISSUE_NUM"
+          } >> "$GITHUB_OUTPUT"
+
+          # Store prompt in a file to preserve newlines and avoid shell mangling
+          printf '%s' "$PROMPT" > "$RUNNER_TEMP/agent_prompt.txt"
+          echo "prompt_file=$RUNNER_TEMP/agent_prompt.txt" >> "$GITHUB_OUTPUT"
 
       - name: Post Initialization Status to Issue
         if: steps.context.outputs.issue_number != ''
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ steps.context.outputs.target_repo }}
+          ISSUE_NUM: ${{ steps.context.outputs.issue_number }}
+          AGENT: ${{ steps.context.outputs.agent_type }}
+          BRANCH: ${{ steps.context.outputs.branch_name }}
         run: |
-          TARGET_REPO="${{ steps.context.outputs.target_repo }}"
-          ISSUE_NUM="${{ steps.context.outputs.issue_number }}"
-          AGENT="${{ steps.context.outputs.agent_type }}"
-          BRANCH="${{ steps.context.outputs.branch_name }}"
-          
           gh issue comment "$ISSUE_NUM" --repo "$TARGET_REPO" --body "🚀 **RemoteAI Agent Initialized**
           - **Engine**: \`$AGENT\`
           - **Runner**: Ubuntu-latest (Compute-on-Demand)
           - **Target Branch**: \`$BRANCH\`
-          
+
           *Setting up dependencies and checking out workspace context...*" || true
 
       - name: Setup Node.js & Environment
@@ -122,19 +147,16 @@ jobs:
       - name: Clone Target Repository
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ steps.context.outputs.target_repo }}
+          BASE: ${{ steps.context.outputs.base_branch }}
+          BRANCH: ${{ steps.context.outputs.branch_name }}
         run: |
-          TARGET_REPO="${{ steps.context.outputs.target_repo }}"
-          BASE="${{ steps.context.outputs.base_branch }}"
-          BRANCH="${{ steps.context.outputs.branch_name }}"
-
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" workspace
           cd workspace
-          
-          # Configure git identity
+
           git config user.name "RemoteAI Agent"
           git config user.email "agent@remoteai.internal"
-          
-          # Check if remote branch exists, otherwise branch off base
+
           if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
             git checkout "$BRANCH"
             git pull origin "$BRANCH"
@@ -142,27 +164,34 @@ jobs:
             git checkout -b "$BRANCH" "origin/$BASE" 2>/dev/null || git checkout -b "$BRANCH"
           fi
 
-      - name: Install & Configure Antigravity CLI (agy)
-        if: steps.context.outputs.agent_type == 'agy'
+      - name: Install Agent Engines
+        env:
+          AGENT: ${{ steps.context.outputs.agent_type }}
         run: |
-          echo "Installing Antigravity CLI (agy)..."
-          curl -fsSL https://antigravity.google/cli/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
 
-          # Configure headless mode for Gemini API Key
-          mkdir -p ~/.gemini/antigravity-cli
-          cat << 'EOF' > ~/.gemini/antigravity-cli/settings.json
-          {
-            "modelProvider": "gemini"
-          }
-          EOF
+          if [ "$AGENT" = "agy" ]; then
+            echo "Installing Antigravity CLI (agy)..."
+            curl -fsSL https://antigravity.google/cli/install.sh | bash || echo "::warning::agy install failed, will use Gemini CLI fallback"
 
-      - name: Install Claude Code CLI
-        if: steps.context.outputs.agent_type == 'claude'
+            echo "Installing Gemini CLI (headless engine + fallback)..."
+            npm install -g @google/gemini-cli
+          else
+            echo "Installing Claude Code CLI..."
+            npm install -g @anthropic-ai/claude-code
+          fi
+
+      - name: Install Workspace Dependencies
         run: |
-          echo "Installing Claude Code CLI..."
-          npm install -g @anthropic-ai/claude-code
+          cd workspace
+          if [ -f "package-lock.json" ]; then
+            echo "Installing deps via npm ci..."
+            npm ci --no-audit --no-fund || npm install --no-audit --no-fund || true
+          elif [ -f "package.json" ]; then
+            echo "Installing deps via npm install..."
+            npm install --no-audit --no-fund || true
+          fi
 
       - name: Execute Coding Agent
         id: run_agent
@@ -170,17 +199,36 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AGENT: ${{ steps.context.outputs.agent_type }}
+          PROMPT_FILE: ${{ steps.context.outputs.prompt_file }}
         run: |
           cd workspace
           export PATH="$HOME/.local/bin:$PATH"
-          AGENT="${{ steps.context.outputs.agent_type }}"
-          PROMPT="${{ steps.context.outputs.prompt }}"
+          PROMPT="$(cat "$PROMPT_FILE")"
 
           echo "Starting Agent: $AGENT"
+          set +e
+          # timeout guards against an interactive/hung agent eating the 30-min job budget
           if [ "$AGENT" = "agy" ]; then
-            agy -p "$PROMPT" --dangerously-skip-permissions --mode accept-edits
+            if command -v agy >/dev/null 2>&1; then
+              timeout 25m agy -p "$PROMPT" --yolo --skip-trust
+              AGY_STATUS=$?
+              if [ "$AGY_STATUS" -ne 0 ]; then
+                echo "agy exited $AGY_STATUS — falling back to Gemini CLI"
+                timeout 25m gemini -p "$PROMPT" --yolo --skip-trust
+              fi
+            else
+              echo "agy not found — using Gemini CLI directly"
+              timeout 25m gemini -p "$PROMPT" --yolo --skip-trust
+            fi
           else
-            claude -p "$PROMPT" --dangerously-skip-permissions
+            timeout 25m claude -p "$PROMPT" --dangerously-skip-permissions
+          fi
+          AGENT_STATUS=$?
+          set -e
+
+          if [ "$AGENT_STATUS" -ne 0 ]; then
+            echo "::warning::Agent exited with status $AGENT_STATUS. Will still commit any produced changes."
           fi
 
       - name: Verify Build & Tests
@@ -200,36 +248,37 @@ jobs:
       - name: Commit, Push & Create Pull Request
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ steps.context.outputs.target_repo }}
+          ISSUE_NUM: ${{ steps.context.outputs.issue_number }}
+          BASE: ${{ steps.context.outputs.base_branch }}
+          BRANCH: ${{ steps.context.outputs.branch_name }}
+          AGENT: ${{ steps.context.outputs.agent_type }}
+          PROMPT_FILE: ${{ steps.context.outputs.prompt_file }}
         run: |
           cd workspace
-          TARGET_REPO="${{ steps.context.outputs.target_repo }}"
-          ISSUE_NUM="${{ steps.context.outputs.issue_number }}"
-          BASE="${{ steps.context.outputs.base_branch }}"
-          BRANCH="${{ steps.context.outputs.branch_name }}"
-          PROMPT="${{ steps.context.outputs.prompt }}"
-          AGENT="${{ steps.context.outputs.agent_type }}"
+          PROMPT="$(cat "$PROMPT_FILE")"
+          # First line of prompt for commit/PR title
+          PROMPT_TITLE=$(printf '%s' "$PROMPT" | head -n 1)
 
-          # Check if any changes were made
           if [ -n "$(git status --porcelain)" ]; then
             echo "Changes detected, committing..."
             git add -A
-            git commit -m "feat(agent): $PROMPT"
+            git commit -m "feat(agent): $PROMPT_TITLE"
             git push -u origin "$BRANCH" --force
 
-            # Check if PR already exists
             PR_EXISTS=$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH" --json number --jq '.[0].number' || echo "")
             if [ -z "$PR_EXISTS" ]; then
-              PR_TITLE="feat: $PROMPT"
+              PR_TITLE="feat: $PROMPT_TITLE"
               PR_BODY="### 🤖 RemoteAI Agent Work Delivery
 
-**Agent Engine:** \`$AGENT\`
-**Triggered by:** Issue #${ISSUE_NUM}
-**Prompt:**
-> $PROMPT
+          **Agent Engine:** \`$AGENT\`
+          **Triggered by:** Issue #${ISSUE_NUM}
+          **Prompt:**
+          > $PROMPT
 
----
-*Generated automatically by RemoteAI Serverless Compute Runner (GitHub Actions).*
-Closes #${ISSUE_NUM}"
+          ---
+          *Generated automatically by RemoteAI Serverless Compute Runner (GitHub Actions).*
+          Closes #${ISSUE_NUM}"
 
               PR_URL=$(gh pr create --repo "$TARGET_REPO" --title "$PR_TITLE" --body "$PR_BODY" --base "$BASE" --head "$BRANCH")
               echo "Created PR: $PR_URL"
@@ -241,10 +290,10 @@ Closes #${ISSUE_NUM}"
             if [ -n "$ISSUE_NUM" ]; then
               gh issue comment "$ISSUE_NUM" --repo "$TARGET_REPO" --body "✅ **Task Complete!**
 
-Code modifications have been pushed and validated.
-🔀 **Pull Request:** $PR_URL
+          Code modifications have been pushed and validated.
+          🔀 **Pull Request:** $PR_URL
 
-You can review the diff and merge directly from your phone!" || true
+          You can review the diff and merge directly from your phone!" || true
             fi
           else
             echo "No changes made by agent."
