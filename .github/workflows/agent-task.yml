@@ -1,0 +1,254 @@
+name: RemoteAI Agent Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'Target Repository (e.g. ekancisme/cuongplaylist)'
+        required: true
+        default: 'ekancisme/cuongplaylist'
+      prompt:
+        description: 'Task Prompt / Instruction'
+        required: true
+      issue_number:
+        description: 'GitHub Issue Number for live chat updates'
+        required: false
+        default: ''
+      agent_type:
+        description: 'Agent Engine (agy or claude)'
+        required: true
+        default: 'agy'
+        type: choice
+        options:
+          - agy
+          - claude
+      base_branch:
+        description: 'Base branch to branch off'
+        required: true
+        default: 'main'
+      branch_name:
+        description: 'Task branch name'
+        required: false
+        default: ''
+
+  issues:
+    types: [opened, labeled]
+
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  run-agent:
+    # Only run for workflow_dispatch or issues/comments labeled with 'remote-agent'
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'remote-agent')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'remote-agent') && github.event.comment.user.type != 'Bot')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve Task Parameters
+        id: context
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET_REPO="${{ inputs.target_repo }}"
+            PROMPT="${{ inputs.prompt }}"
+            ISSUE_NUM="${{ inputs.issue_number }}"
+            AGENT="${{ inputs.agent_type }}"
+            BASE="${{ inputs.base_branch }}"
+            BRANCH="${{ inputs.branch_name }}"
+          elif [ "${{ github.event_name }}" = "issues" ]; then
+            TARGET_REPO="${{ github.repository }}"
+            PROMPT="${{ github.event.issue.body }}"
+            ISSUE_NUM="${{ github.event.issue.number }}"
+            AGENT="agy"
+            BASE="main"
+            BRANCH=""
+          else
+            TARGET_REPO="${{ github.repository }}"
+            PROMPT="${{ github.event.comment.body }}"
+            ISSUE_NUM="${{ github.event.issue.number }}"
+            AGENT="agy"
+            BASE="main"
+            BRANCH=""
+          fi
+
+          if [ -z "$BRANCH" ]; then
+            TIMESTAMP=$(date +%s)
+            BRANCH="agent/task-${ISSUE_NUM:-$TIMESTAMP}"
+          fi
+
+          echo "target_repo=$TARGET_REPO" >> "$GITHUB_OUTPUT"
+          echo "prompt=$PROMPT" >> "$GITHUB_OUTPUT"
+          echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+          echo "agent_type=$AGENT" >> "$GITHUB_OUTPUT"
+          echo "base_branch=$BASE" >> "$GITHUB_OUTPUT"
+          echo "branch_name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Post Initialization Status to Issue
+        if: steps.context.outputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_REPO="${{ steps.context.outputs.target_repo }}"
+          ISSUE_NUM="${{ steps.context.outputs.issue_number }}"
+          AGENT="${{ steps.context.outputs.agent_type }}"
+          BRANCH="${{ steps.context.outputs.branch_name }}"
+          
+          gh issue comment "$ISSUE_NUM" --repo "$TARGET_REPO" --body "🚀 **RemoteAI Agent Initialized**
+          - **Engine**: \`$AGENT\`
+          - **Runner**: Ubuntu-latest (Compute-on-Demand)
+          - **Target Branch**: \`$BRANCH\`
+          
+          *Setting up dependencies and checking out workspace context...*" || true
+
+      - name: Setup Node.js & Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone Target Repository
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_REPO="${{ steps.context.outputs.target_repo }}"
+          BASE="${{ steps.context.outputs.base_branch }}"
+          BRANCH="${{ steps.context.outputs.branch_name }}"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" workspace
+          cd workspace
+          
+          # Configure git identity
+          git config user.name "RemoteAI Agent"
+          git config user.email "agent@remoteai.internal"
+          
+          # Check if remote branch exists, otherwise branch off base
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
+          else
+            git checkout -b "$BRANCH" "origin/$BASE" 2>/dev/null || git checkout -b "$BRANCH"
+          fi
+
+      - name: Install & Configure Antigravity CLI (agy)
+        if: steps.context.outputs.agent_type == 'agy'
+        run: |
+          echo "Installing Antigravity CLI (agy)..."
+          curl -fsSL https://antigravity.google/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Configure headless mode for Gemini API Key
+          mkdir -p ~/.gemini/antigravity-cli
+          cat << 'EOF' > ~/.gemini/antigravity-cli/settings.json
+          {
+            "modelProvider": "gemini"
+          }
+          EOF
+
+      - name: Install Claude Code CLI
+        if: steps.context.outputs.agent_type == 'claude'
+        run: |
+          echo "Installing Claude Code CLI..."
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Execute Coding Agent
+        id: run_agent
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cd workspace
+          export PATH="$HOME/.local/bin:$PATH"
+          AGENT="${{ steps.context.outputs.agent_type }}"
+          PROMPT="${{ steps.context.outputs.prompt }}"
+
+          echo "Starting Agent: $AGENT"
+          if [ "$AGENT" = "agy" ]; then
+            agy -p "$PROMPT" --dangerously-skip-permissions --mode accept-edits
+          else
+            claude -p "$PROMPT" --dangerously-skip-permissions
+          fi
+
+      - name: Verify Build & Tests
+        id: verify
+        run: |
+          cd workspace
+          if [ -f "package.json" ]; then
+            if grep -q '"test"' package.json; then
+              echo "Running npm test..."
+              npm test || true
+            elif grep -q '"build"' package.json; then
+              echo "Running npm run build..."
+              npm run build || true
+            fi
+          fi
+
+      - name: Commit, Push & Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          cd workspace
+          TARGET_REPO="${{ steps.context.outputs.target_repo }}"
+          ISSUE_NUM="${{ steps.context.outputs.issue_number }}"
+          BASE="${{ steps.context.outputs.base_branch }}"
+          BRANCH="${{ steps.context.outputs.branch_name }}"
+          PROMPT="${{ steps.context.outputs.prompt }}"
+          AGENT="${{ steps.context.outputs.agent_type }}"
+
+          # Check if any changes were made
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Changes detected, committing..."
+            git add -A
+            git commit -m "feat(agent): $PROMPT"
+            git push -u origin "$BRANCH" --force
+
+            # Check if PR already exists
+            PR_EXISTS=$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH" --json number --jq '.[0].number' || echo "")
+            if [ -z "$PR_EXISTS" ]; then
+              PR_TITLE="feat: $PROMPT"
+              PR_BODY="### 🤖 RemoteAI Agent Work Delivery
+
+**Agent Engine:** \`$AGENT\`
+**Triggered by:** Issue #${ISSUE_NUM}
+**Prompt:**
+> $PROMPT
+
+---
+*Generated automatically by RemoteAI Serverless Compute Runner (GitHub Actions).*
+Closes #${ISSUE_NUM}"
+
+              PR_URL=$(gh pr create --repo "$TARGET_REPO" --title "$PR_TITLE" --body "$PR_BODY" --base "$BASE" --head "$BRANCH")
+              echo "Created PR: $PR_URL"
+            else
+              PR_URL="https://github.com/$TARGET_REPO/pull/$PR_EXISTS"
+              echo "Updated existing PR: $PR_URL"
+            fi
+
+            if [ -n "$ISSUE_NUM" ]; then
+              gh issue comment "$ISSUE_NUM" --repo "$TARGET_REPO" --body "✅ **Task Complete!**
+
+Code modifications have been pushed and validated.
+🔀 **Pull Request:** $PR_URL
+
+You can review the diff and merge directly from your phone!" || true
+            fi
+          else
+            echo "No changes made by agent."
+            if [ -n "$ISSUE_NUM" ]; then
+              gh issue comment "$ISSUE_NUM" --repo "$TARGET_REPO" --body "ℹ️ **Task Finished:** The agent completed analysis, but no code changes were needed." || true
+            fi
+          fi
