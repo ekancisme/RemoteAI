@@ -8,7 +8,7 @@ import { TaskFeed } from './components/TaskFeed';
 import { githubService, type GitHubUser, type GitHubRepo, type GitHubIssue } from './services/githubApi';
 import { AlertCircle, CheckCircle } from 'lucide-react';
 
-const DEFAULT_RUNNER_REPO = 'ekancisme/cuongplaylist';
+const DEFAULT_RUNNER_REPO = 'ekancisme/RemoteAI';
 
 export function App() {
   const [token, setToken] = useState<string>(() => {
